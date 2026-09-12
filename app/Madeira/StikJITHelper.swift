@@ -73,20 +73,27 @@ enum StikJITHelper {
         }
     }
 
-    /// TrollStore path: ask TrollStore to enable JIT (best effort — the user
-    /// may also have used TrollStore's own "Open with JIT", in which case the
-    /// flag is already set), then poll for CS_DEBUGGED. No StikDebug backend
-    /// is engaged, so callers must use the direct (non-BRK) pool path.
+    /// TrollStore path: ask TrollStore to enable JIT, then poll for
+    /// CS_DEBUGGED. No StikDebug backend is engaged, so callers must use
+    /// the direct (non-BRK) pool path. NOTE: deliberately NOT gated on
+    /// canOpenURL — on some setups it returns false for apple-magnifier://
+    /// even though open() resolves fine (verified via Safari). open() needs
+    /// no LSApplicationQueriesSchemes entry; only canOpenURL does. The
+    /// completion handler is authoritative.
     static func enableJITTrollStore(completion: @escaping (Bool) -> Void) {
         let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"
-        if trollStoreAvailable,
-           let url = URL(string: "apple-magnifier://enable-jit?bundle-id=\(bundleId)") {
-            LogStore.shared.log("Opening TrollStore JIT enabler...")
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
-        } else {
-            LogStore.shared.log("TrollStore URL not reachable — enable JIT from TrollStore directly, waiting for flag...")
+        guard let url = URL(string: "apple-magnifier://enable-jit?bundle-id=\(bundleId)") else {
+            LogStore.shared.log("Bad TrollStore URL — enable JIT from TrollStore directly, waiting for flag...")
+            pollForJIT(timeoutSeconds: 60, completion: completion)
+            return
         }
-        pollForJIT(timeoutSeconds: 60, completion: completion)
+        LogStore.shared.log("canOpenURL(apple-magnifier) says \(trollStoreAvailable) (advisory only) — opening anyway...")
+        UIApplication.shared.open(url, options: [:]) { opened in
+            LogStore.shared.log(opened
+                ? "TrollStore opened — waiting for flag..."
+                : "TrollStore did not open — enable JIT from TrollStore directly, waiting for flag...")
+            pollForJIT(timeoutSeconds: 60, completion: completion)
+        }
     }
 
     /// Poll every 0.5s until CS_DEBUGGED is set, then call completion.
