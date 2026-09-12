@@ -849,6 +849,11 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
+    // CS_DEBUGGED flag state (the actual JIT gate). Differs from
+    // debuggerAttached under TrollStore: attach-detach leaves the flag
+    // sticky with no live debugger, so P_TRACED alone would stay red
+    // forever despite working JIT.
+    @State private var jitFlagSet = false
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
     @Namespace private var pointerNS
@@ -1078,9 +1083,11 @@ struct ContentView: View {
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
         HStack(spacing: 8) {
-            // Live debugger/JIT state, not the (macOS-only, never granted on
-            // iOS) allow-jit entitlement the old badge checked.
-            entitlementBadge("JIT", granted: debuggerAttached)
+            // Live debugger/JIT state: green if a debugger is attached OR the
+            // kernel JIT flag is set (TrollStore sets it without staying
+            // attached). The old badge checked P_TRACED only, so it stayed
+            // orange under TrollStore despite functional JIT.
+            entitlementBadge("JIT", granted: debuggerAttached || jitFlagSet)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
             Spacer()
@@ -1100,6 +1107,7 @@ struct ContentView: View {
         .padding(.bottom, 8)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             debuggerAttached = isDebuggerAttached()
+            jitFlagSet = jit_check_debugged()
         }
     }
 
