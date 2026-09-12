@@ -27,6 +27,18 @@ enum StikJITHelper {
         return UIApplication.shared.canOpenURL(url)
     }
 
+    /// True once OUR stikjit:// open succeeds this session (StikDebug backend
+    /// engaged — BRKs will be serviced). Mirrored into C via
+    /// jit_set_stik_backend so jit26_* calls stay safe.
+    static var stikEngaged = false
+
+    /// TrollStore's JIT enabler URL is reachable (needs apple-magnifier in
+    /// LSApplicationQueriesSchemes for canOpenURL to answer).
+    static var trollStoreAvailable: Bool {
+        guard let url = URL(string: "apple-magnifier://enable-jit") else { return false }
+        return UIApplication.shared.canOpenURL(url)
+    }
+
     /// Open StikDebug with our JIT script embedded in the URL.
     /// StikDebug will attach to our process and run the script.
     static func enableJIT(completion: @escaping (Bool) -> Void) {
@@ -51,18 +63,49 @@ enum StikJITHelper {
                 return
             }
 
+            // OUR StikDebug session is now engaged: BRKs will be serviced.
+            // (Set before polling so any BRK from here on is safe.)
+            stikEngaged = true
+            jit_set_stik_backend(true)
+
             // Poll for CS_DEBUGGED flag
             pollForJIT(completion: completion)
         }
     }
 
+    /// TrollStore path: ask TrollStore to enable JIT (best effort — the user
+    /// may also have used TrollStore's own "Open with JIT", in which case the
+    /// flag is already set), then poll for CS_DEBUGGED. No StikDebug backend
+    /// is engaged, so callers must use the direct (non-BRK) pool path.
+    static func enableJITTrollStore(completion: @escaping (Bool) -> Void) {
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"
+        if trollStoreAvailable,
+           let url = URL(string: "apple-magnifier://enable-jit?bundle-id=\(bundleId)") {
+            LogStore.shared.log("Opening TrollStore JIT enabler...")
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        } else {
+            LogStore.shared.log("TrollStore URL not reachable — enable JIT from TrollStore directly, waiting for flag...")
+        }
+        pollForJIT(timeoutSeconds: 60, completion: completion)
+    }
+
     /// Poll every 0.5s until CS_DEBUGGED is set, then call completion.
-    private static func pollForJIT(completion: @escaping (Bool) -> Void) {
+    /// Times out (completion(false)) instead of spinning forever, so a
+    /// never-enabled TrollStore flow fails visibly rather than hanging.
+    private static func pollForJIT(timeoutSeconds: Int = 30, completion: @escaping (Bool) -> Void) {
+        var elapsed = 0.0
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
             if jit_check_debugged() {
                 timer.invalidate()
                 LogStore.shared.log("JIT enabled! (CS_DEBUGGED set)", level: .success)
                 completion(true)
+                return
+            }
+            elapsed += 0.5
+            if elapsed >= Double(timeoutSeconds) {
+                timer.invalidate()
+                LogStore.shared.log("Timed out waiting for CS_DEBUGGED.", level: .error)
+                completion(false)
             }
         }
     }
@@ -77,32 +120,27 @@ enum StikJITHelper {
         return result
     }
 
-    /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
-    /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
-    static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
-        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
+    /// Pool placement rules, shared by the debugger (BRK) and direct
+    /// (TrollStore) paths — FEX's dispatcher emit breaks below goodLow, and
+    /// pool code inside the x86-64 guest window hangs silently.
+    private static let poolGoodLow = 0x119000000
+    private static let poolGuestLo = 0x7000000000
+    private static let poolGuestHi = 0x8000000000
 
-        // iOS-Madeira: FEX's dispatcher emit has a position-dependent encoding
-        // bug — only works when the JIT pool lands at a high enough address
-        // (empirically ≥ 0x119000000, so dispatcher at +0x7ffc130 has top byte
-        // 0x12). When iOS allocates 0x114-0x117xxx the dispatcher's literal-
-        // pool fixups silently break and execution branches to zero memory
-        // before the first compiled block runs. Pre-claim ~96MB of low address
-        // space to push the next ANYWHERE allocation up.
-        //
-        // We keep these allocations alive for the lifetime of the process —
-        // freeing them could let iOS reuse them and cause aliasing issues.
+    /// Pre-claim low address space so the kernel's ANYWHERE frontier lands
+    /// high. Mappings persist in the kernel (nothing deallocates them), so
+    /// the returned array is only bookkeeping. Shared by both pool paths.
+    @discardableResult
+    private static func pinLowAddressSpace() -> [vm_address_t] {
+        // (See the FEX dispatcher note originally above allocatePool: the
+        // pool must land ≥ 0x119000000 or literal-pool fixups break and
+        // execution branches to zero before block 0 runs.)
         var pinChunks: [vm_address_t] = []
         let chunkSize = 16 * 1024 * 1024  // 16 MB per chunk
-        // Pin until the allocation frontier crosses the mode-A threshold
-        // (0x119000000) instead of a fixed 96MB. A fixed count loses the
-        // ASLR lottery whenever the base slide is low (observed 2026-07-03:
-        // 6 chunks ended at 0x118790000, pool landed 8.4MB short of the
-        // threshold and the run fast-failed). vm_allocate is zero-fill
-        // reserve-only, so extra chunks don't add resident footprint.
-        // The BAD POOL check below stays as the safety net for non-
-        // sequential placements.
-        let pinTarget: vm_address_t = 0x119000000
+        // Pin until the frontier crosses the mode-A threshold instead of a
+        // fixed count (a fixed count loses the ASLR lottery when the base
+        // slide is low). vm_allocate is zero-fill reserve-only, so extra
+        // chunks don't add resident footprint.
         let maxChunks = 32                 // safety cap (512 MB of reservation)
         for i in 0..<maxChunks {
             var addr: vm_address_t = 0
@@ -110,12 +148,31 @@ enum StikJITHelper {
             if kr == KERN_SUCCESS {
                 pinChunks.append(addr)
                 LogStore.shared.log(String(format: "JIT-pool pin chunk %d at 0x%lx (16MB)", i, Int(addr)))
-                if addr + vm_address_t(chunkSize) >= pinTarget { break }
+                if addr + vm_address_t(chunkSize) >= vm_address_t(poolGoodLow) { break }
             } else {
                 LogStore.shared.log("JIT-pool pin chunk \(i) FAILED kr=\(kr)", level: .error)
                 break
             }
         }
+        return pinChunks
+    }
+
+    /// nil = placement OK, else a short reason string for logs.
+    private static func placementProblem(addr: Int, size: Int) -> String? {
+        if addr < poolGoodLow { return "mode A low" }
+        if addr + size > poolGuestLo && addr < poolGuestHi { return "guest 64G window" }
+        return nil
+    }
+
+    /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
+    /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
+    static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
+        // Pre-claim low address space to push the ANYWHERE frontier up
+        // (shared helper; see pinLowAddressSpace for the rationale).
+        // We keep these allocations alive for the lifetime of the process —
+        // freeing them could let iOS reuse them and cause aliasing issues.
+        _ = pinLowAddressSpace()
 
         // Ask debugger to allocate RX pages (x0=0 triggers _M allocation).
         // With pin chunks claimed, this should land at a higher address.
@@ -141,24 +198,20 @@ enum StikJITHelper {
         // fix needs explicit placement (hinted allocation / reserve-and-carve),
         // not a re-roll; simply pinning the bad region to force a different address
         // costs another 896MB against the 4096MB jetsam ceiling.
-        let goodLow = 0x119000000
-        let guestLo = 0x7000000000
-        let guestHi = 0x8000000000
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
         for attempt in 0..<3 {
             guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
-                LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
+                LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt)) — no StikDebug backend servicing BRKs?", level: .error)
                 break
             }
             let a = Int(bitPattern: p)
-            let inGuestWindow = a + poolSize > guestLo && a < guestHi
-            if a >= goodLow && !inGuestWindow {
+            if let reason = placementProblem(addr: a, size: poolSize) {
+                LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
+                                           a, reason, attempt), level: .error)
+            } else {
                 rxPtrOpt = p
                 break
             }
-            LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
-                                       a, a < goodLow ? "mode A low" : "guest 64G window",
-                                       attempt), level: .error)
             let dkr = vm_deallocate(mach_task_self_, vm_address_t(a), vm_size_t(poolSize))
             LogStore.shared.log(dkr == KERN_SUCCESS
                 ? "  bad region freed"
@@ -303,8 +356,67 @@ enum StikJITHelper {
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
     }
 
+    /// TrollStore/direct path: NO debugger backend, NO BRK calls. Builds the
+    /// pool straight from dual-mapped regions — legal once CS_DEBUGGED is set
+    /// (TrollStore's JIT flag is sufficient on pre-TXM iOS for RWX mappings).
+    /// Same placement rules as the debugger path. The JITRegion handle is
+    /// kept alive in `directRegion` for the life of the process (the pool is
+    /// never freed, same as the debugger-backed one).
+    private static var directRegion: UnsafeMutablePointer<JITRegion>?
+    static func allocatePoolDirect(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool (direct dual-map, no debugger)...")
+        _ = pinLowAddressSpace()
+        for attempt in 0..<3 {
+            guard let region = jit_region_create(poolSize) else {
+                LogStore.shared.log("Direct dual-map create failed (attempt \(attempt)) — kernel refused EXECUTE mapping?", level: .error)
+                break
+            }
+            guard let rxPtr = jit_region_rx_ptr(region), let rwPtr = jit_region_rw_ptr(region) else {
+                LogStore.shared.log("Direct dual-map returned null views (attempt \(attempt))", level: .error)
+                jit_region_destroy(region)
+                continue
+            }
+            let a = Int(bitPattern: rxPtr)
+            if let reason = placementProblem(addr: a, size: poolSize) {
+                LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
+                                           a, reason, attempt), level: .error)
+                jit_region_destroy(region)
+                continue
+            }
+            directRegion = region
+            LogStore.shared.log("Direct dual-map pool: RX=\(String(format: "%p", a)), RW=\(String(format: "%p", Int(bitPattern: rwPtr))), size=\(poolSize / 1024 / 1024)MB", level: .success)
+            return (rx: rxPtr, rw: rwPtr, size: poolSize)
+        }
+        LogStore.shared.log("BAD POOL: direct dual-map failed after retries. Killing in 10s — please relaunch.", level: .error)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
+            LogStore.shared.log("BAD POOL — exiting now. Relaunch the app.", level: .error)
+            exit(0)
+        }
+        return nil
+    }
+
+    /// Production entry point: picks the pool backend. StikDebug (BRK
+    /// protocol) when OUR session is engaged, otherwise direct dual-map
+    /// (TrollStore / any CS_DEBUGGED without a script backend). The BRK path
+    /// keeps its existing terminal behavior untouched.
+    static func allocateProductionPool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        if stikEngaged {
+            LogStore.shared.log("Using StikDebug (BRK) pool path...")
+            return allocatePool(poolSize: poolSize)
+        }
+        LogStore.shared.log("No StikDebug backend — using direct dual-map pool path (TrollStore)...")
+        return allocatePoolDirect(poolSize: poolSize)
+    }
+
     /// Detach the debugger. Call this after Wine is done loading PE DLLs.
+    /// No-op unless OUR StikDebug session is engaged: in TrollStore/direct
+    /// mode nothing is attached, and firing BRK there could SIGTRAP-crash
+    /// (the C layer also guards this, belt and suspenders).
     static func detachDebugger() {
+        guard stikEngaged else {
+            LogStore.shared.log("No StikDebug session — skipping detach.")
+            return
+        }
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
         // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED

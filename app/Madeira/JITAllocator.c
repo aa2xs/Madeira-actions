@@ -83,6 +83,30 @@ static void jit_log(const char *fmt, ...) {
     fprintf(stderr, "[JIT] %s\n", buf);
 }
 
+// TrollStore/direct-JIT support. BRK #0xf00d is only serviced when a
+// StikDebug session is engaged. Firing BRK with no listener SIGTRAPs —
+// harmless if our skip-handler is installed (returns NULL/0), FATAL if
+// it isn't (handler skips installation when already traced at startup,
+// which is exactly the TrollStore-preattached case). So every BRK call
+// site goes through jit_brk_safe(): engaged-backend OR installed-handler,
+// otherwise the call is skipped without trapping.
+// (Placed after jit_log, which the setter below uses.)
+static bool g_stik_backend = false;
+static bool g_trap_installed = false;
+
+void jit_set_stik_backend(bool engaged) {
+    g_stik_backend = engaged;
+    jit_log("StikDebug backend %s", engaged ? "ENGAGED" : "disengaged");
+}
+
+bool jit_trap_handler_installed(void) {
+    return g_trap_installed;
+}
+
+static bool jit_brk_safe(void) {
+    return g_stik_backend || g_trap_installed;
+}
+
 static size_t align_to_page(size_t size) {
     return (size + JIT_PAGE_SIZE - 1) & ~(JIT_PAGE_SIZE - 1);
 }
@@ -390,6 +414,7 @@ void jit_install_trap_handler(void) {
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = sigtrap_handler;
     sigaction(SIGTRAP, &sa, NULL);
+    g_trap_installed = true;
     jit_log("SIGTRAP handler installed (no debugger)");
 }
 
@@ -401,6 +426,13 @@ void jit_install_trap_handler(void) {
 
 __attribute__((noinline, optnone))
 void *jit26_prepare_region(void *addr, size_t len) {
+    // TrollStore mode: no debugger backend is servicing BRKs. Firing one
+    // here would SIGTRAP-crash when the skip-handler was never installed
+    // (traced at startup), so refuse upfront and let the caller fall back
+    // to direct dual-map allocation.
+    if (!jit_brk_safe()) {
+        return NULL;
+    }
     register void *x0 __asm__("x0") = addr;
     register size_t x1 __asm__("x1") = len;
     __asm__ volatile(
@@ -415,6 +447,11 @@ void *jit26_prepare_region(void *addr, size_t len) {
 
 __attribute__((noinline, optnone))
 void jit26_detach(void) {
+    // Nothing attached in TrollStore/direct mode — detaching would just
+    // fire an unserviced BRK. Silent no-op (callers also guard this).
+    if (!jit_brk_safe()) {
+        return;
+    }
     __asm__ volatile(
         "mov x16, #0\n"
         "brk #0xf00d\n"

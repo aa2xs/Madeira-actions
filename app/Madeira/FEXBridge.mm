@@ -125,13 +125,49 @@ static bool jit_pool_init(void) {
     // Step 1: Ask debugger to allocate RX pages
     fex_log("Requesting debugger to allocate %zu bytes of RX memory...", size);
     void *rx_ptr = jit26_prepare_region(NULL, size);
+    JITRegion *directRegion = nullptr;
     if (!rx_ptr) {
-        fex_log("FAIL: Debugger RX allocation returned NULL");
-        return false;
+        // No debugger backend servicing BRKs (e.g. TrollStore JIT, which only
+        // sets CS_DEBUGGED). jit26_prepare_region refuses to trap in that
+        // state and returns NULL instead of crashing — fall back to a
+        // self-made dual-mapped region, legal once CS_DEBUGGED is set.
+        if (!jit_check_debugged()) {
+            fex_log("FAIL: Debugger RX allocation returned NULL and not debugged");
+            return false;
+        }
+        fex_log("No StikDebug backend — direct dual-map fallback...");
+        // Same placement rules as the Swift pool (FEX dispatcher bug below
+        // 0x119000000, x86-64 guest window must stay clear).
+        for (int attempt = 0; attempt < 3 && !rx_ptr; attempt++) {
+            JITRegion *r = jit_region_create(size);
+            if (!r) {
+                fex_log("direct dual-map attempt %d: create failed", attempt);
+                continue;
+            }
+            uintptr_t a = reinterpret_cast<uintptr_t>(jit_region_rx_ptr(r));
+            if (a < 0x119000000u || (a + size > 0x7000000000ull && a < 0x8000000000ull)) {
+                fex_log("direct dual-map attempt %d: bad placement %p, retrying", attempt, (void *)a);
+                jit_region_destroy(r);
+                continue;
+            }
+            directRegion = r;
+            rx_ptr = jit_region_rx_ptr(r);
+        }
+        if (!rx_ptr) {
+            fex_log("FAIL: Direct dual-map pool failed");
+            return false;
+        }
+        fex_log("Direct dual-map pool at %p", rx_ptr);
+    } else {
+        fex_log("Debugger allocated RX at %p", rx_ptr);
     }
-    fex_log("Debugger allocated RX at %p", rx_ptr);
 
-    // Step 2: vm_remap to create RW view of the same pages
+    // Step 2: vm_remap to create RW view of the same pages (debugger path
+    // only — the direct path already has its RW view from jit_region_create).
+    void *rw_ptr;
+    if (directRegion) {
+        rw_ptr = jit_region_rw_ptr(directRegion);
+    } else {
     vm_address_t rw_addr = 0;
     vm_prot_t cur_prot = 0, max_prot = 0;
     kern_return_t kr = vm_remap(
@@ -152,9 +188,11 @@ static bool jit_pool_init(void) {
         vm_deallocate(task, rw_addr, size);
         return false;
     }
+    rw_ptr = reinterpret_cast<void*>(rw_addr);
+    }  // end else (debugger path remap)
 
     g_jit_rx_base = rx_ptr;
-    g_jit_rw_base = reinterpret_cast<void*>(rw_addr);
+    g_jit_rw_base = rw_ptr;
     g_jit_pool_size = size;
 
     int64_t write_offset = reinterpret_cast<intptr_t>(g_jit_rw_base) - reinterpret_cast<intptr_t>(g_jit_rx_base);

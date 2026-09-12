@@ -1135,7 +1135,7 @@ struct ContentView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 Button("Enable JIT") {
-                    enableJITViaStikDebug()
+                    enableJIT()
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -1718,17 +1718,43 @@ struct ContentView: View {
         }
     }
 
-    private func enableJITViaStikDebug() {
+    private func enableJIT() {
         jitStatus = .testing
-        logStore.log("Requesting JIT via StikDebug URL scheme...")
-
-        StikJITHelper.enableJIT { success in
+        // TrollStore (or any external debugger) may already have set the
+        // flag before we ran — then there is nothing to open, just report
+        // which backend will serve pool allocation (StikDebug BRK iff OUR
+        // session was engaged, else direct dual-map).
+        if jit_check_debugged() {
+            if StikJITHelper.stikEngaged {
+                jitStatus = .available
+                logStore.log("JIT already enabled via StikDebug.", level: .success)
+            } else {
+                jitStatus = .available
+                logStore.log("JIT already enabled (debugger flag set, no StikDebug session — direct/TrollStore mode).", level: .success)
+            }
+            return
+        }
+        if StikJITHelper.isAvailable {
+            logStore.log("Requesting JIT via StikDebug URL scheme...")
+            StikJITHelper.enableJIT { success in
+                if success {
+                    jitStatus = .available
+                    logStore.log("JIT enabled! Debugger attached.", level: .success)
+                } else {
+                    jitStatus = .unavailable
+                    logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                }
+            }
+            return
+        }
+        logStore.log("StikDebug not installed — trying TrollStore JIT enabler...")
+        StikJITHelper.enableJITTrollStore { success in
             if success {
                 jitStatus = .available
-                logStore.log("JIT enabled! Debugger attached.", level: .success)
+                logStore.log("JIT enabled via TrollStore (direct mode, no StikDebug backend).", level: .success)
             } else {
                 jitStatus = .unavailable
-                logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                logStore.log("JIT not enabled. Install StikDebug, or enable JIT from TrollStore and retry.", level: .error)
             }
         }
     }
@@ -1991,12 +2017,12 @@ struct ContentView: View {
             }
 
             winios_phase("pool-alloc-begin")
-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+            logStore.log("Allocating \(poolSizeMB)MB JIT pool (backend: \(StikJITHelper.stikEngaged ? "StikDebug BRK" : "direct dual-map"))...")
             let t0 = CFAbsoluteTimeGetCurrent()
-            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            let pool = StikJITHelper.allocateProductionPool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            logStore.log("Pool allocation took \(String(format: "%.2f", elapsed))s")
 
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
@@ -2102,7 +2128,13 @@ struct ContentView: View {
                 // wrong conclusion I wrote into the source. A run without the pool can
                 // only manufacture misleading secondary crashes, so refuse to start one.
                 logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
-                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
+                if StikJITHelper.stikEngaged {
+                    logStore.log("  StikDebug backend gave no usable pool (see lines above).", level: .info)
+                } else {
+                    logStore.log("  Direct backend gave no usable pool: kernel refused EXECUTE", level: .info)
+                    logStore.log("  mappings or every placement was bad. Is JIT really enabled?", level: .info)
+                    logStore.log("  Enable JIT from TrollStore (or StikDebug) and relaunch.", level: .info)
+                }
                 logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)

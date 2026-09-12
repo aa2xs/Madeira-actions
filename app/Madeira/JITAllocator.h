@@ -53,6 +53,17 @@ bool jit_check_debugged(void);
 // when no debugger is attached. Must be called before any jit26_* functions.
 void jit_install_trap_handler(void);
 
+// StikDebug backend engagement flag, set from Swift when OUR stikjit://
+// open succeeds. Gates BRK execution (see jit_brk_safe in the .c): without
+// an engaged backend AND without the SIGTRAP skip-handler, firing BRK
+// would SIGTRAP-crash (TrollStore-preattached case).
+void jit_set_stik_backend(bool engaged);
+
+// True if jit_install_trap_handler() actually installed the SIGTRAP skip.
+// Lets callers decide between the BRK protocol and direct allocation
+// without firing a probe BRK (which is itself unsafe when false).
+bool jit_trap_handler_installed(void);
+
 // iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
 // prepare a memory region for JIT execution.
 // Returns the prepared address (may differ from input on allocation).
