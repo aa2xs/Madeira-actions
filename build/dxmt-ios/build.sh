@@ -21,6 +21,14 @@ COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -fblocks -O
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
 INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"
+# {fmt} from FEX's vendored copy (fmt 12.1) — replaces std::format, whose
+# libc++ implementation instantiates std::to_chars(float) via the runtime
+# arg dispatcher, and Apple marks to_chars unavailable before iOS 16.3.
+# fmt::format is a 1:1 std::format replacement (same author, returns
+# std::string) and the app already links FEX's libfmt.a built from this
+# exact source, so no extra library is needed. -fno-exceptions is
+# auto-detected by fmt via __cpp_exceptions (FEXCore builds identically).
+INCLUDES_FMT="-I$REPO_ROOT/FEX/External/fmt/include"
 LLVM_INCLUDES="-I$LLVM_BUILD/include -I$LLVM_SRC/include"
 AIRCONV_DEFS="-D_FILE_OFFSET_BITS=64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
 CXX_FLAGS="-std=c++20 -fno-exceptions -fno-rtti"
@@ -43,7 +51,7 @@ compile_objc() {
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
     printf "  %-40s " "$name"
-    if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $LLVM_INCLUDES $AIRCONV_DEFS $extra \
+    if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $INCLUDES_FMT $LLVM_INCLUDES $AIRCONV_DEFS $extra \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
     else

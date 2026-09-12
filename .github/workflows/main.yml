@@ -564,7 +564,46 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-b4b89f0-${{ env.CACHE_V }}
+          key: dxmt-b4b89f0-ios16-${{ env.CACHE_V }}
+
+      # Apple's libc++ marks floating-point std::to_chars as unavailable
+      # before iOS 16.3, and std::format's runtime argument dispatcher
+      # instantiates it even when only integers are formatted — so every
+      # airconv file calling std::format fails to compile at a 16.0
+      # deployment target. fmt::format is a drop-in replacement (same
+      # author, same algorithms, returns std::string) and the app already
+      # links FEX's libfmt.a built from the exact vendored source
+      # (FEX/External/fmt), so no extra library is needed. Only the iOS
+      # side is patched: the PE (llvm-mingw) build never compiles these
+      # files and its libc++ has no Apple availability restrictions.
+      - name: Patch DXMT airconv std::format -> fmt
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          files = [
+              "research/dxmt/src/airconv/dxbc_signature.cpp",
+              "research/dxmt/src/airconv/dxbc_converter_gs.cpp",
+              "research/dxmt/src/airconv/nt/air_builder.cpp",
+          ]
+          for rel in files:
+              p = Path(rel)
+              s = p.read_text()
+              if "fmt/format.h" in s:
+                  print(f"{rel}: already patched")
+                  continue
+              n = s.count("std::format(")
+              assert "#include <format>" in s, f"{rel}: <format> include not found"
+              s = s.replace("#include <format>", "#include <fmt/format.h>")
+              s = s.replace("std::format(", "fmt::format(")
+              assert "std::format(" not in s, f"{rel}: std::format call remains"
+              p.write_text(s)
+              print(f"{rel}: replaced {n} std::format call(s)")
+          PY
+          grep -c "fmt::format(" \
+            research/dxmt/src/airconv/dxbc_signature.cpp \
+            research/dxmt/src/airconv/dxbc_converter_gs.cpp \
+            research/dxmt/src/airconv/nt/air_builder.cpp
 
       - name: DXMT
         if: steps.dxmt.outputs.cache-hit != 'true'
