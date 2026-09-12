@@ -362,7 +362,7 @@ enum StikJITHelper {
     /// Same placement rules as the debugger path. The JITRegion handle is
     /// kept alive in `directRegion` for the life of the process (the pool is
     /// never freed, same as the debugger-backed one).
-    private static var directRegion: UnsafeMutablePointer<JITRegion>?
+    private static var directRegion: OpaquePointer?
     static func allocatePoolDirect(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool (direct dual-map, no debugger)...")
         _ = pinLowAddressSpace()
