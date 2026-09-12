@@ -564,7 +564,7 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-b4b89f0-ios16-${{ env.CACHE_V }}
+          key: dxmt-b4b89f0-ios16pmr-${{ env.CACHE_V }}
 
       # Apple's libc++ marks floating-point std::to_chars as unavailable
       # before iOS 16.3, and std::format's runtime argument dispatcher
@@ -624,6 +624,25 @@ jobs:
              ../../app/Madeira/aarch64-windows/
           cd ../../build/dxmt-ios
           ./build.sh
+          # Back-deploy std::pmr::memory_resource for iOS 16.0: FEX subclasses
+          # it for its custom allocators, and the base destructor (+vtable and
+          # typeinfo, emitted with it as the key function) only exists in
+          # /usr/lib/libc++.1.dylib from iOS 16.4 on — a binary targeting 16.0
+          # compiles and links fine but aborts at launch with "Symbol not
+          # found". memory_resource has no data members, so this empty
+          # definition is exactly what the newer dylib provides: zero
+          # behavior change, just satisfied locally. Compiled with plain
+          # flags (no -fno-rtti/-fno-exceptions), mirroring libc++ itself.
+          cat > pmr_shim.cpp <<'EOF'
+          #include <memory_resource>
+          namespace std { namespace pmr {
+          memory_resource::~memory_resource() = default;
+          } }
+          EOF
+          xcrun -sdk iphoneos clang++ -std=c++20 -O2 \
+            -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -miphoneos-version-min=16.0 \
+            -c pmr_shim.cpp -o obj/pmr_shim.o
           xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
             obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
           cp libdxmt_combined.a ../../app/Madeira/
@@ -683,6 +702,17 @@ jobs:
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build
+
+      - name: Verify no iOS 16.0-unavailable libc++ symbols
+        run: |
+          set -euxo pipefail
+          echo "=== undefined std::pmr symbols in final binary (must be none) ==="
+          if nm -u out/Madeira.app/Madeira | grep -q "__ZNSt3__13pmr"; then
+            echo "FATAL: app still references libc++ pmr symbols missing on iOS 16.0:"
+            nm -u out/Madeira.app/Madeira | grep "__ZNSt3__13pmr" || true
+            exit 1
+          fi
+          echo "clean: no undefined pmr symbols"
 
       - name: Package IPA
         run: |
