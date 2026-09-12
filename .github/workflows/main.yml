@@ -730,6 +730,20 @@ jobs:
           fi
           echo "clean: no pmr binds"
 
+      - name: Sign with entitlements (ad-hoc)
+        run: |
+          set -euxo pipefail
+          # xcodebuild runs with CODE_SIGNING_ALLOWED=NO (no certs on the
+          # runner), so entitlements would never reach the binary. Ad-hoc
+          # sign here embeds them (allow-jit, increased-memory-limit,
+          # extended-virtual-addressing) for sideloading; no identity needed.
+          codesign --force --sign - --timestamp=none \
+            --entitlements app/Madeira/Madeira.entitlements \
+            out/Madeira.app
+          echo "=== embedded entitlements (must list the three) ==="
+          codesign -d --entitlements :- out/Madeira.app
+          codesign -dv out/Madeira.app/Madeira 2>&1 | head -5
+
       - name: Package IPA
         run: |
           set -euxo pipefail
