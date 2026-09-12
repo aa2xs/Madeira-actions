@@ -564,7 +564,7 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-b4b89f0-ios16pmr-${{ env.CACHE_V }}
+          key: dxmt-b4b89f0-ios16pmr2-${{ env.CACHE_V }}
 
       # Apple's libc++ marks floating-point std::to_chars as unavailable
       # before iOS 16.3, and std::format's runtime argument dispatcher
@@ -624,25 +624,10 @@ jobs:
              ../../app/Madeira/aarch64-windows/
           cd ../../build/dxmt-ios
           ./build.sh
-          # Back-deploy std::pmr::memory_resource for iOS 16.0: FEX subclasses
-          # it for its custom allocators, and the base destructor (+vtable and
-          # typeinfo, emitted with it as the key function) only exists in
-          # /usr/lib/libc++.1.dylib from iOS 16.4 on — a binary targeting 16.0
-          # compiles and links fine but aborts at launch with "Symbol not
-          # found". memory_resource has no data members, so this empty
-          # definition is exactly what the newer dylib provides: zero
-          # behavior change, just satisfied locally. Compiled with plain
-          # flags (no -fno-rtti/-fno-exceptions), mirroring libc++ itself.
-          cat > pmr_shim.cpp <<'EOF'
-          #include <memory_resource>
-          namespace std { namespace pmr {
-          memory_resource::~memory_resource() = default;
-          } }
-          EOF
-          xcrun -sdk iphoneos clang++ -std=c++20 -O2 \
-            -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
-            -miphoneos-version-min=16.0 \
-            -c pmr_shim.cpp -o obj/pmr_shim.o
+          # NOTE: the std::pmr back-deploy shim intentionally lives ONLY in
+          # the dedicated libpmrshim.a (built in its own step, -force_load'ed
+          # at link). Do NOT add a copy here: two static definitions of the
+          # same symbol would be a duplicate-symbol link error.
           xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
             obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
           cp libdxmt_combined.a ../../app/Madeira/
@@ -689,6 +674,31 @@ jobs:
           PY
           grep -n "glassEffect" "$F" && { echo "FATAL: calls remain"; exit 1; } || true
 
+      # The pmr back-deploy shim must END UP defined in the final binary
+      # regardless of static-archive link order (libc++.tbd is linked before
+      # libdxmt_combined.a, so a shim member sitting in that archive is never
+      # consulted once the reference binds to the dylib). A tiny dedicated
+      # archive + -force_load (see the xcodebuild step) guarantees it.
+      # Rebuilt every run (uncached, seconds) so it can never go stale.
+      - name: Build pmr back-deploy shim
+        run: |
+          set -euxo pipefail
+          mkdir -p build/pmr-shim
+          cat > build/pmr-shim/pmr_shim.cpp <<'EOF'
+          #include <memory_resource>
+          namespace std { namespace pmr {
+          memory_resource::~memory_resource() = default;
+          } }
+          EOF
+          xcrun -sdk iphoneos clang++ -std=c++20 -O2 \
+            -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -miphoneos-version-min=16.0 \
+            -c build/pmr-shim/pmr_shim.cpp -o build/pmr-shim/pmr_shim.o
+          xcrun -sdk iphoneos libtool -static \
+            -o build/pmr-shim/libpmrshim.a build/pmr-shim/pmr_shim.o
+          xcrun -sdk iphoneos nm -m build/pmr-shim/libpmrshim.a | grep "memory_resourceD2Ev" \
+            || { echo "FATAL: shim archive lacks the pmr dtor"; exit 1; }
+
       - name: Build Madeira.app
         run: |
           set -euxo pipefail
@@ -701,18 +711,24 @@ jobs:
             CONFIGURATION_BUILD_DIR="$PWD/out" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            OTHER_LDFLAGS="-Xlinker -force_load -Xlinker $PWD/build/pmr-shim/libpmrshim.a" \
             build
 
+      # nm -u cannot be trusted here (it missed a live bind). dyld_info reads
+      # the actual chained-fixup payload, i.e. exactly what dyld will bind
+      # at launch. Any pmr bind left means iOS 16.0 will abort — fail here.
       - name: Verify no iOS 16.0-unavailable libc++ symbols
         run: |
           set -euxo pipefail
-          echo "=== undefined std::pmr symbols in final binary (must be none) ==="
-          if nm -u out/Madeira.app/Madeira | grep -q "__ZNSt3__13pmr"; then
-            echo "FATAL: app still references libc++ pmr symbols missing on iOS 16.0:"
-            nm -u out/Madeira.app/Madeira | grep "__ZNSt3__13pmr" || true
+          echo "=== std::pmr binds in final binary (must be none) ==="
+          dyld_info -fixups out/Madeira.app/Madeira > /tmp/dyld_fixups.txt
+          wc -l /tmp/dyld_fixups.txt
+          if grep -q "St3__13pmr" /tmp/dyld_fixups.txt; then
+            echo "FATAL: app still binds libc++ pmr symbols missing on iOS 16.0:"
+            grep "St3__13pmr" /tmp/dyld_fixups.txt || true
             exit 1
           fi
-          echo "clean: no undefined pmr symbols"
+          echo "clean: no pmr binds"
 
       - name: Package IPA
         run: |
