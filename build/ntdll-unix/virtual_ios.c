@@ -3811,6 +3811,19 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     unsigned char *data_map = NULL;
     extern int ios_teb_tls_slot_offset;
 
+    /* Diagnostic probe (TrollStore hang triage): the Wine main thread was
+     * observed parked inside this function for entire sessions (identical
+     * PC/SP across all thread dumps, cpu=0) right after ucrtbase mapped,
+     * with no window/D3D/present activity ever following. Entry/exit lines
+     * below (with a per-call sequence number) distinguish "never entered",
+     * "entered and stuck", and "called repeatedly"; text_rx correlates with
+     * the [jit-pool] image lines to name the module. dprintf only — this
+     * path can run where wine log macros fault (ml374). */
+    static int patch_seq = 0;
+    int my_seq = __sync_add_and_fetch(&patch_seq, 1);
+    dprintf(2, "[x18-patch] #%d ENTER text_rx=%p size=0x%zx tramp_rx=%p tramp_size=0x%zx\n",
+            my_seq, text_rx, text_size, tramp_rx, tramp_size);
+
     /* B/BL reach guard (Steam S3 run 11 root cause): imm26 spans ±128MB.
      * The patcher used to encode out-of-range tramp offsets silently
      * truncated mod 256MB → branches into untouched pool (the run 7-11
@@ -3844,6 +3857,8 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
      * — an unpatched real instruction degrades to a recoverable runtime
      * fault, while a patched literal is fatal. Asymmetry favors skipping. */
     data_map = ios_x18_build_data_map( text_rw, text_size );
+    dprintf(2, "[x18-patch] #%d datamap %s, scanning 0x%zx bytes\n",
+            my_seq, data_map ? "built" : "NULL", text_size);
 
     /* Pass 0: retarget hand-written TEB-from-TSD reads.
      *
@@ -4057,6 +4072,8 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         }
     }
 
+    dprintf(2, "[x18-patch] #%d DONE patched=%d skipped=%d lit_skipped=%d\n",
+            my_seq, count, skipped, lit_skipped);
     return count;
 }
 

@@ -29,6 +29,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -10881,8 +10882,17 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
 
         /* M8: Ask the debugger to write TEB data to page 0 via BRK #0xf00d cmd 3.
          * The debugger may have kernel privileges that the app doesn't.
-         * Uses GDB M (memory write) command to write TEB data at address 0. */
-        if (!mapped) {
+         * Uses GDB M (memory write) command to write TEB data at address 0.
+         * Gated on jit_brk_safe(): with no StikDebug backend servicing BRKs
+         * and no SIGTRAP skip-handler installed (TrollStore-preattached
+         * case), firing BRK here would SIGTRAP-crash the process instead of
+         * failing gracefully like every other M-attempt above. */
+        extern bool jit_brk_safe(void);
+        bool try_debugger = !mapped && jit_brk_safe();
+        if (!mapped && !try_debugger) {
+            ERR("page0: skipping debugger BRK (no backend servicing BRKs and no SIGTRAP skip-handler installed — firing it would crash)\n");
+        }
+        if (try_debugger) {
             ERR("page0: trying debugger (BRK #0xf00d, x16=3)...\n");
             register uintptr_t x0_val __asm__("x0") = (uintptr_t)teb;
             register size_t x1_val __asm__("x1") = 0x4000;

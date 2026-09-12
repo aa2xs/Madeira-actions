@@ -64,6 +64,13 @@ void jit_set_stik_backend(bool engaged);
 // without firing a probe BRK (which is itself unsafe when false).
 bool jit_trap_handler_installed(void);
 
+// True if firing BRK #0xf00d is safe right now: either OUR StikDebug
+// session is engaged (debugger services it) or the SIGTRAP skip-handler
+// is installed (unserviced BRK degrades to NULL/0). Other translation
+// units with raw BRK emissions gate on this — firing without it
+// SIGTRAP-crashes when traced-at-startup left no handler installed.
+bool jit_brk_safe(void);
+
 // iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
 // prepare a memory region for JIT execution.
 // Returns the prepared address (may differ from input on allocation).

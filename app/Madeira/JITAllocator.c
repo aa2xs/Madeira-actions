@@ -103,7 +103,10 @@ bool jit_trap_handler_installed(void) {
     return g_trap_installed;
 }
 
-static bool jit_brk_safe(void) {
+// Exported (see JITAllocator.h) so other translation units with raw BRK
+// emissions (e.g. Wine's page-zero attempt) can gate them identically:
+// BRK is only safe with an engaged backend or an installed skip-handler.
+bool jit_brk_safe(void) {
     return g_stik_backend || g_trap_installed;
 }
 
